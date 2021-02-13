@@ -40,7 +40,7 @@
     non_ascii_idents
 )]
 
-use flume::{bounded, unbounded, Sender};
+use crossbeam_channel::{bounded, unbounded, Sender};
 use once_cell::sync::Lazy;
 use std::{
     fmt,

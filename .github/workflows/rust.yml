@@ -1,0 +1,61 @@
+name: Rust
+
+on: push
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install stable rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+          profile: minimal
+      - uses: actions/checkout@v2
+      - name: Build
+        uses: actions-rs/cargo@v1
+        with:
+          command: build
+          args: --all --all-features
+      - name: Test
+        uses: actions-rs/cargo@v1
+        with:
+          command: test
+          args: --all --all-features
+
+  clippy-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install stable rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+          profile: minimal
+          components: clippy
+      - uses: actions/checkout@v2
+      - uses: actions-rs/clippy-check@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          args: --all --all-features
+
+  rustfmt-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install stable rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+          profile: minimal
+          components: rustfmt
+      - uses: actions/checkout@v2
+      - uses: actions-rs/cargo@v1
+        with:
+          command: fmt
+          args: --all -- --check

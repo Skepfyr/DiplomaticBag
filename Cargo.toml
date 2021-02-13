@@ -10,8 +10,10 @@ readme = "README.md"
 keywords = ["send", "sync"]
 categories = ["rust-patterns", "concurrency"]
 
+exclude = [".github"]
+
 [dependencies]
-flume = { version = "0.10", default-features = false }
+crossbeam-channel = "0.5"
 once_cell = "1"
 
 [dev-dependencies]
