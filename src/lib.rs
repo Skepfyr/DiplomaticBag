@@ -193,9 +193,9 @@ impl<T> DiplomaticBag<T> {
     /// # use diplomatic_bag::DiplomaticBag;
     /// let foo = DiplomaticBag::new(|| vec!["ho"; 3]);
     /// let foo: Vec<_> = foo.and_then(|handler, foo| {
-    ///     foo.map(|item| handler.wrap(item)).collect()
+    ///     foo.into_iter().map(|item| handler.wrap(item)).collect()
     /// });
-    /// # assert_eq!("ho", foo[0].into_inner());
+    /// # assert_eq!(&"ho", foo[0].as_ref().into_inner());
     /// ```
     pub fn and_then<U, F>(self, f: F) -> U
     where
@@ -332,6 +332,7 @@ impl<T, E> DiplomaticBag<Result<T, E>> {
     ///
     /// # Examples
     /// ```
+    /// # use diplomatic_bag::DiplomaticBag;
     /// fn foo() -> Result<DiplomaticBag<()>, String> {
     ///     let bag = DiplomaticBag::new(|| {
     ///         Ok(())
@@ -363,7 +364,8 @@ impl<T> DiplomaticBag<Option<T>> {
     ///
     /// # Examples
     /// ```
-    /// DiplomaticBag::new(|| Some(())).transpose().unwrap_or_default()
+    /// # use diplomatic_bag::DiplomaticBag;
+    /// DiplomaticBag::new(|| Some(())).transpose().unwrap_or_default();
     /// ```
     pub fn transpose(self) -> Option<DiplomaticBag<T>> {
         // Safety:
@@ -460,13 +462,13 @@ impl<T: Ord> Ord for DiplomaticBag<T> {
 /// # Examples
 /// ```
 /// # use diplomatic_bag::DiplomaticBag;
-/// let one = DiplomaticBag::new(|_| 1);
-/// let two = DiplomaticBag::new(|_| 2);
+/// let one = DiplomaticBag::new(|| 1);
+/// let two = DiplomaticBag::new(|| 2);
 /// let three = one.and_then(|handler, one| {
 ///     let three = one + handler.unwrap(two.as_ref());
 ///     handler.wrap(three)
 /// });
-/// # assert_eq!(3, three.execute(|_, three| three));
+/// # assert_eq!(3, three.into_inner());
 #[derive(Debug, Clone, Copy)]
 pub struct BaggageHandler<'a>(PhantomData<(&'a (), *mut ())>);
 
@@ -486,9 +488,9 @@ impl BaggageHandler<'_> {
     /// # Examples
     /// ```
     /// # use diplomatic_bag::DiplomaticBag;
-    /// let foo: DiplomaticBag<u8> = DiplomaticBag::new(|_| 2);
+    /// let foo: DiplomaticBag<u8> = DiplomaticBag::new(|| 2);
     /// let bar: DiplomaticBag<u8> =
-    ///     foo.execute_ref(|handler, value| handler.wrap(value.clone()));
+    ///     foo.and_then(|handler, value| handler.wrap(value.clone()));
     /// ```
     pub fn wrap<T>(&self, value: T) -> DiplomaticBag<T> {
         DiplomaticBag {
@@ -501,9 +503,9 @@ impl BaggageHandler<'_> {
     /// # Examples
     /// ```
     /// # use diplomatic_bag::DiplomaticBag;
-    /// let one = DiplomaticBag::new(|_| 1);
-    /// let two = DiplomaticBag::new(|_| 2);
-    /// let three = one.execute(|handler, one| one + handler.unwrap(two));
+    /// let one = DiplomaticBag::new(|| 1);
+    /// let two = DiplomaticBag::new(|| 2);
+    /// let three = one.and_then(|handler, one| one + handler.unwrap(two));
     /// # assert_eq!(3, three);
     /// ```
     pub fn unwrap<T>(&self, proxy: DiplomaticBag<T>) -> T {
