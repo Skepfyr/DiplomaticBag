@@ -16,12 +16,12 @@
 //! # use diplomatic_bag::DiplomaticBag;
 //! # use std::{cell::RefCell, rc::Rc};
 //! // `Rc` is neither `Send` nor `Sync`
-//! let foo = DiplomaticBag::new(|| Rc::new(RefCell::new(0)));
+//! let foo = DiplomaticBag::new(|_| Rc::new(RefCell::new(0)));
 //!
 //! std::thread::spawn({
 //!     let foo = foo.clone();
 //!     move || {
-//!         foo.as_ref().map(|rc| {
+//!         foo.as_ref().map(|_, rc| {
 //!             *rc.borrow_mut() = 1;
 //!         });
 //!     }
@@ -39,6 +39,7 @@
     missing_docs,
     non_ascii_idents
 )]
+#![forbid(unsafe_op_in_unsafe_fn)]
 
 use crossbeam_channel::{bounded, unbounded, Sender};
 use once_cell::sync::Lazy;
@@ -47,28 +48,21 @@ use std::{
     marker::PhantomData,
     mem::{self, ManuallyDrop},
     ptr,
-    sync::Mutex,
+    thread::ThreadId,
 };
 
 /// The (sender for) the thread that all the values live on. This is lazily
 /// created when the first `DiplomaticBag` is created, but will never shut down.
-static THREAD_SENDER: Lazy<Sender<Message>> = Lazy::new(|| {
+static THREAD_SENDER: Lazy<(Sender<Message>, ThreadId)> = Lazy::new(|| {
     let (sender, receiver) = unbounded::<Message>();
-    std::thread::spawn({
+    let thread = std::thread::spawn({
         move || {
-            while let Ok(Message { closure, response }) = receiver.recv() {
-                // Run the code given to us, we need to be careful here to not
-                // store anything off as the caller's safety relies on us
-                // dropping everything before sending something down `response`.
+            while let Ok(closure) = receiver.recv() {
                 closure();
-                // Notify the caller that we are done with everything that was
-                // lent to us. Ignore any errors as there's nothing sensible we
-                // can do.
-                let _ = response.send(());
             }
         }
     });
-    sender
+    (sender, thread.thread().id())
 });
 
 /// A wrapper around a `T` that always implements [`Send`] and [`Sync`], but
@@ -87,7 +81,7 @@ static THREAD_SENDER: Lazy<Sender<Message>> = Lazy::new(|| {
 /// let mut foo = ();
 /// // `*mut T` doesn't implement `Send` or `Sync`,
 /// // but `DiplomaticBag<*mut T>` does.
-/// let bar = DiplomaticBag::new(|| (&mut foo) as *mut ());
+/// let bar = DiplomaticBag::new(|_| (&mut foo) as *mut ());
 /// std::thread::spawn(|| bar);
 /// ```
 ///
@@ -101,9 +95,13 @@ static THREAD_SENDER: Lazy<Sender<Message>> = Lazy::new(|| {
 ///
 /// # Blocking
 /// Another consequence of every bag using the same thread is that no two values
-/// can be modified concurrently, essentially sharing a lock on the thread. You
-/// should aim to do as little computation as possible inside the closures you
-/// provide to the functions on this type to prevent your code from blocking
+/// can be modified concurrently, essentially sharing a lock on the thread. In
+/// general, you should be protected from this; [`run`] and all the methods on
+/// this type will detect if they are being run on the worker thread and will
+/// avoid "taking the lock", alternatively you can use the [`BaggageHandler`] to
+/// wrap and unwrap diplomatic bags safely.
+/// You should aim to do as little computation as possible inside the closures
+/// you provide to the functions on this type to prevent your code from blocking
 /// the progress of others. All functions block until they have completed
 /// executing the closure on the worker thread.
 pub struct DiplomaticBag<T> {
@@ -123,11 +121,11 @@ impl<T> DiplomaticBag<T> {
     /// this look at the type-level or crate-level docs.
     pub fn new<F>(f: F) -> Self
     where
-        F: FnOnce() -> T,
+        F: FnOnce(BaggageHandler) -> T,
         F: Send,
     {
-        run(|| DiplomaticBag {
-            value: Untouchable::new(f()),
+        run(|handler| DiplomaticBag {
+            value: Untouchable::new(f(handler)),
         })
     }
 
@@ -138,8 +136,9 @@ impl<T> DiplomaticBag<T> {
     /// should also not panic, if it does all other active bags will leak, see
     /// the type-level docs for more information.
     ///
-    /// If you need to access the contents of multiple bags simultaneously, look
-    /// at the [`zip()`][Self::zip()] method.
+    /// If you need to access the contents of multiple bags simultaneously, you can
+    /// use the provided [`BaggageHandler`], alternatively see the
+    /// [`zip()`][Self::zip()] method.
     ///
     /// # Panics
     /// This function will panic if there is an issue with the underlying worker
@@ -149,25 +148,25 @@ impl<T> DiplomaticBag<T> {
     /// ```
     /// # use diplomatic_bag::DiplomaticBag;
     /// # use std::{cell::RefCell, rc::Rc};
-    /// let foo = DiplomaticBag::new(|| Rc::new(RefCell::new(5)));
-    /// let five = foo.map(|foo| {
+    /// let foo = DiplomaticBag::new(|_| Rc::new(RefCell::new(5)));
+    /// let five = foo.map(|_, foo| {
     ///     Rc::try_unwrap(foo).unwrap().into_inner()
     /// });
     /// # assert_eq!(5, five.into_inner());
     /// ```
     pub fn map<U, F>(self, f: F) -> DiplomaticBag<U>
     where
-        F: FnOnce(T) -> U,
+        F: FnOnce(BaggageHandler, T) -> U,
         F: Send,
     {
-        run(move || {
+        run(move |handler| {
             // Safety:
             // `into_inner` can only be called on the worker thread, as it gives
             // access to a value of type `T` and `T` isn't necessarily `Send`,
             // however that's where this will run.
             let value = unsafe { self.into_inner_unchecked() };
             DiplomaticBag {
-                value: Untouchable::new(f(value)),
+                value: Untouchable::new(f(handler, value)),
             }
         })
     }
@@ -191,7 +190,7 @@ impl<T> DiplomaticBag<T> {
     /// # Examples
     /// ```
     /// # use diplomatic_bag::DiplomaticBag;
-    /// let foo = DiplomaticBag::new(|| vec!["ho"; 3]);
+    /// let foo = DiplomaticBag::new(|_| vec!["ho"; 3]);
     /// let foo: Vec<_> = foo.and_then(|handler, foo| {
     ///     foo.into_iter().map(|item| handler.wrap(item)).collect()
     /// });
@@ -200,16 +199,15 @@ impl<T> DiplomaticBag<T> {
     pub fn and_then<U, F>(self, f: F) -> U
     where
         U: Send,
-        F: for<'a> FnOnce(BaggageHandler<'a>, T) -> U,
+        F: FnOnce(BaggageHandler, T) -> U,
         F: Send,
     {
-        run(move || {
+        run(move |handler| {
             // Safety:
             // `into_inner` can only be called on the worker thread, as it gives
             // access to a value of type `T` and `T` isn't necessarily `Send`,
             // however that's where this will run.
             let value = unsafe { self.into_inner_unchecked() };
-            let handler = unsafe { BaggageHandler::new() };
             f(handler, value)
         })
     }
@@ -223,9 +221,9 @@ impl<T> DiplomaticBag<T> {
     /// # Examples
     /// ```
     /// # use diplomatic_bag::DiplomaticBag;
-    /// let one = DiplomaticBag::new(|| 1);
-    /// let two = DiplomaticBag::new(|| 2);
-    /// let three = one.zip(two).map(|(one, two)| one + two);
+    /// let one = DiplomaticBag::new(|_| 1);
+    /// let two = DiplomaticBag::new(|_| 2);
+    /// let three = one.zip(two).map(|_, (one, two)| one + two);
     /// # assert_eq!(3, three.into_inner());
     /// ```
     pub fn zip<U>(self, other: DiplomaticBag<U>) -> DiplomaticBag<(T, U)> {
@@ -234,9 +232,6 @@ impl<T> DiplomaticBag<T> {
         // so they spend the minimum amount of time on this thread. The only
         // danger here is them accidentally getting dropped on this thread, but
         // none of these functions can panic.
-        //
-        // Note, I'm not particularly happy with this as the `T` and the `U`
-        // spend a worrying amount of time on this thread in a droppable form.
         let value = unsafe {
             Untouchable::new((self.into_inner_unchecked(), other.into_inner_unchecked()))
         };
@@ -248,8 +243,8 @@ impl<T> DiplomaticBag<T> {
     /// # Examples
     /// ```
     /// # use diplomatic_bag::DiplomaticBag;
-    /// let a = DiplomaticBag::new(|| 0);
-    /// let b = a.as_ref().map(|a| a.clone());
+    /// let a = DiplomaticBag::new(|_| 0);
+    /// let b = a.as_ref().map(|_, a| a.clone());
     /// # assert_eq!(a, b);
     /// ```
     pub fn as_ref(&self) -> DiplomaticBag<&T> {
@@ -266,9 +261,9 @@ impl<T> DiplomaticBag<T> {
     /// # Examples
     /// ```
     /// # use diplomatic_bag::DiplomaticBag;
-    /// let mut a = DiplomaticBag::new(|| 1);
-    /// let mut b = DiplomaticBag::new(|| 2);
-    /// a.as_mut().zip(b.as_mut()).map(|(a, b)| {
+    /// let mut a = DiplomaticBag::new(|_| 1);
+    /// let mut b = DiplomaticBag::new(|_| 2);
+    /// a.as_mut().zip(b.as_mut()).map(|_, (a, b)| {
     ///     std::mem::swap(a, b);
     /// });
     /// # assert_eq!(2, a.into_inner());
@@ -294,9 +289,10 @@ impl<T> DiplomaticBag<T> {
         // the outer struct so the drop code isn't run. Note that the memory is
         // still freed as the bag was moved into this function, but every field
         // should be read out so that all of their destructors are run.
-        let value = ptr::read(&self.value);
+        let value = unsafe { ptr::read(&self.value) };
         mem::forget(self);
-        value.into_inner()
+        // Safety: We forward these safety requirements to our caller.
+        unsafe { value.into_inner() }
     }
 }
 
@@ -316,9 +312,9 @@ impl<T: Send> DiplomaticBag<T> {
     /// # Examples
     /// ```
     /// # use diplomatic_bag::DiplomaticBag;
-    /// let one = DiplomaticBag::new(|| 1);
-    /// let two = DiplomaticBag::new(|| 2);
-    /// let eq = one.zip(two).map(|(one, two)| one == two).into_inner();
+    /// let one = DiplomaticBag::new(|_| 1);
+    /// let two = DiplomaticBag::new(|_| 2);
+    /// let eq = one.zip(two).map(|_, (one, two)| one == two).into_inner();
     /// # assert!(!eq);
     /// ```
     pub fn into_inner(self) -> T {
@@ -334,7 +330,7 @@ impl<T, E> DiplomaticBag<Result<T, E>> {
     /// ```
     /// # use diplomatic_bag::DiplomaticBag;
     /// fn foo() -> Result<DiplomaticBag<()>, String> {
-    ///     let bag = DiplomaticBag::new(|| {
+    ///     let bag = DiplomaticBag::new(|_| {
     ///         Ok(())
     ///     });
     ///     bag.transpose().map_err(|err| err.into_inner())
@@ -343,9 +339,14 @@ impl<T, E> DiplomaticBag<Result<T, E>> {
     pub fn transpose(self) -> Result<DiplomaticBag<T>, DiplomaticBag<E>> {
         // Safety:
         // Unclear, this isn't safe by the letter of the law as we read the
-        // bytes of inner to determine if it's `Ok` or `Err`. However, this feels
-        // safe because we never actually run any code that could depend on `!Send`
-        // bits of `T` or `E`.
+        // bytes of inner to determine if it's `Ok` or `Err`. However, although
+        // not yet defined, `Send` and `Sync` are probably safety invariants,
+        // not validity invariants. This means we can violate the contracts in
+        // unsafe code soundly, as long as the T is never exposed on a different
+        // thread to (uncontrolled) safe code.
+        //
+        // This only reads whether this is `Ok` or `Err` and this method cannot
+        // panic, so no code that uses the thread invariant can observe T or E.
         let inner = unsafe { self.into_inner_unchecked() };
         match inner {
             Ok(val) => Ok(DiplomaticBag {
@@ -365,30 +366,32 @@ impl<T> DiplomaticBag<Option<T>> {
     /// # Examples
     /// ```
     /// # use diplomatic_bag::DiplomaticBag;
-    /// DiplomaticBag::new(|| Some(())).transpose().unwrap_or_default();
+    /// DiplomaticBag::new(|_| Some(())).transpose().unwrap_or_default();
     /// ```
     pub fn transpose(self) -> Option<DiplomaticBag<T>> {
         // Safety:
-        // Unclear, this isn't safe by the letter of the law as we read the
-        // bytes of inner to determine if it's `Some` or `None`. However, this
-        // feels safe for the same reason as above.
+        // Same as above `transpose` for `DiplomaticBag<Result<T, E>>`.
         let inner = unsafe { self.into_inner_unchecked() };
-        match inner {
-            Some(val) => Some(DiplomaticBag {
-                value: Untouchable::new(val),
-            }),
-            None => None,
-        }
+        inner.map(|val| DiplomaticBag {
+            value: Untouchable::new(val),
+        })
     }
 }
 
 /// `Drop` the inner type when the `DiplomaticBag` is dropped.
 ///
 /// Ideally, this would only be implemented when `T` is `Drop` but `Drop` must
-/// be implemented for all specializations of a generic type or none.
+/// be implemented for all specializations of a generic type or none. However,
+/// it does use [`std::mem::needs_drop`] to identify if the drop code needs to
+/// be run.
 impl<T> Drop for DiplomaticBag<T> {
     fn drop(&mut self) {
-        let _ = try_run(|| {
+        if !std::mem::needs_drop::<T>() {
+            // If no drop code needs to be run for `T` we are fine to simply
+            // deallocate it.
+            return;
+        }
+        let _ = try_run(|_| {
             // Safety:
             // The inner value must only be accessed from the worker thread, and
             // that is where this closure will run.
@@ -410,18 +413,20 @@ impl<T> fmt::Debug for DiplomaticBag<T> {
 
 // We can, however, implement a bunch of other useful standard traits, as below.
 // Annoyingly, `Display`, `serde::Serialize`, and `serde::Deserialize` all
-// suffer from the same problem as `Debug`. Also, `AsRef`, `AsMut`, `From`, and
-// `TryFrom` all fail for similar reasons.
+// suffer from the same problem as `Debug`. `From`, and `TryFrom` fail due
+// to the orphan rules. `AsRef` and `AsMut` can be implemented but conflict with
+// the existing `as_ref` and `as_mut` methods, and I'm not sure the confusion is
+// worth it.
 
 impl<T: Default> Default for DiplomaticBag<T> {
     fn default() -> Self {
-        DiplomaticBag::new(T::default)
+        DiplomaticBag::new(|_| T::default())
     }
 }
 
 impl<T: Clone> Clone for DiplomaticBag<T> {
     fn clone(&self) -> Self {
-        self.as_ref().map(T::clone)
+        self.as_ref().map(|_, val| T::clone(val))
     }
 }
 
@@ -429,7 +434,7 @@ impl<T: PartialEq> PartialEq for DiplomaticBag<T> {
     fn eq(&self, other: &Self) -> bool {
         self.as_ref()
             .zip(other.as_ref())
-            .map(|(this, other)| T::eq(this, other))
+            .map(|_, (this, other)| T::eq(this, other))
             .into_inner()
     }
 }
@@ -439,7 +444,7 @@ impl<T: PartialOrd> PartialOrd for DiplomaticBag<T> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         self.as_ref()
             .zip(other.as_ref())
-            .map(|(this, other)| T::partial_cmp(this, other))
+            .map(|_, (this, other)| T::partial_cmp(this, other))
             .into_inner()
     }
 }
@@ -447,7 +452,7 @@ impl<T: Ord> Ord for DiplomaticBag<T> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.as_ref()
             .zip(other.as_ref())
-            .map(|(this, other)| T::cmp(this, other))
+            .map(|_, (this, other)| T::cmp(this, other))
             .into_inner()
     }
 }
@@ -462,17 +467,17 @@ impl<T: Ord> Ord for DiplomaticBag<T> {
 /// # Examples
 /// ```
 /// # use diplomatic_bag::DiplomaticBag;
-/// let one = DiplomaticBag::new(|| 1);
-/// let two = DiplomaticBag::new(|| 2);
+/// let one = DiplomaticBag::new(|_handler| 1);
+/// let two = DiplomaticBag::new(|_handler| 2);
 /// let three = one.and_then(|handler, one| {
 ///     let three = one + handler.unwrap(two.as_ref());
 ///     handler.wrap(three)
 /// });
 /// # assert_eq!(3, three.into_inner());
 #[derive(Debug, Clone, Copy)]
-pub struct BaggageHandler<'a>(PhantomData<(&'a (), *mut ())>);
+pub struct BaggageHandler(PhantomData<*mut ()>);
 
-impl BaggageHandler<'_> {
+impl BaggageHandler {
     /// Create a new `BaggageHandler`.
     ///
     /// # Safety
@@ -488,7 +493,7 @@ impl BaggageHandler<'_> {
     /// # Examples
     /// ```
     /// # use diplomatic_bag::DiplomaticBag;
-    /// let foo: DiplomaticBag<u8> = DiplomaticBag::new(|| 2);
+    /// let foo: DiplomaticBag<u8> = DiplomaticBag::new(|_handler| 2);
     /// let bar: DiplomaticBag<u8> =
     ///     foo.and_then(|handler, value| handler.wrap(value.clone()));
     /// ```
@@ -503,8 +508,8 @@ impl BaggageHandler<'_> {
     /// # Examples
     /// ```
     /// # use diplomatic_bag::DiplomaticBag;
-    /// let one = DiplomaticBag::new(|| 1);
-    /// let two = DiplomaticBag::new(|| 2);
+    /// let one = DiplomaticBag::new(|_handler| 1);
+    /// let two = DiplomaticBag::new(|_handler| 2);
     /// let three = one.and_then(|handler, one| one + handler.unwrap(two));
     /// # assert_eq!(3, three);
     /// ```
@@ -516,12 +521,12 @@ impl BaggageHandler<'_> {
 /// Run an arbitrary closure on the shared worker thread.
 ///
 /// # Panics
-/// This panics if the operation fails for any reason, usually due to the
-/// shared worker thread not running for some reason.
-fn run<R, F>(f: F) -> R
+/// This panics if the provided closure fails or the worker thread is not
+/// running, which will happen if a previous operation panicked.
+pub fn run<R, F>(f: F) -> R
 where
     R: Send,
-    F: FnOnce() -> R,
+    F: FnOnce(BaggageHandler) -> R,
     F: Send,
 {
     try_run(f).unwrap()
@@ -529,7 +534,7 @@ where
 
 /// Run an arbitrary closure on the shared worker thread, similar to the
 /// [`run()`][Self::run()] method. However, this does _not_ panic if the
-/// worker thread has stopped unlike all the other methods on this type.
+/// worker thread has stopped unlike [`run`].
 ///
 /// # Errors
 /// This will throw an error if the operation fails, usually due to an issue
@@ -537,57 +542,57 @@ where
 fn try_run<R, F>(f: F) -> Result<R, Error>
 where
     R: Send,
-    F: FnOnce() -> R,
+    F: FnOnce(BaggageHandler) -> R,
     F: Send,
 {
-    // Location to write the result of the computation to. In an ideal world
-    // the result of the closure would come back up the response channel,
-    // but that would require a lot of messing around due to types having
-    // different sizes. We work around all that by writing it directly to
-    // this bit of memory.
-    let result = Mutex::new(Option::None);
-    let result_ref = &result;
+    let (task_sender, worker) = &*THREAD_SENDER;
+
+    if std::thread::current().id() == *worker {
+        // If the current thread is the worker thread then run the closure.
+        // This (mostly) prevents a deadlock where a closure on the worker
+        // thread is waiting for another operation in the worker threads queue.
+
+        // Safety: we are on the worker thread.
+        let baggage_handler = unsafe { BaggageHandler::new() };
+        return Ok(f(baggage_handler));
+    }
+
+    // Set up a rendezvous channel so that the closure can return the value.
+    let (sender, receiver) = bounded(0);
     // This is the closure that will get run on the worker thread, it gets
     // boxed up as we're passing ownership to that thread and we can't pass
     // it directly due to every invocation of this function potentially
     // having a different closure type.
     let closure = Box::new(move || {
-        let value = f();
-        let mut result = result_ref.lock().unwrap();
-        *result = Some(value);
+        let baggage_handler = unsafe { BaggageHandler::new() };
+        let value = f(baggage_handler);
+        let _ = sender.send(value);
+        // Note that after calling `send` we have dropped or returned all values
+        // that could possibly be holding references to data on the calling
+        // thread, which makes it safe for `try_run` to return.
     }) as Box<dyn FnOnce() + Send>;
-    // Extend the closure's lifetime as rust doesn't know what the thread
-    // we're sending this closure to is going to do with it.
+
+    // Extend the closure's lifetime as rust doesn't know that we won't return
+    // until the closure has given all possible references back to us.
     // Safety:
     // We have to be careful with this closure from now on but we know that
     // anything borrowed by the closure must live at least as long as this
-    // function call, or when `result` is invalid. So we must be careful
-    // that this closure is dropped before this function returns and `result`
-    // is dropped.
+    // function call. So we must be careful that this closure is dropped before
+    // this function returns and `result` is dropped.
     let closure: Box<dyn FnOnce() + Send + 'static> = unsafe { mem::transmute(closure) };
-    // Set up a rendezvous channel so that the worker thread can signal when
-    // it is done with the closure.
-    let (response, receiver) = bounded(0);
-    // Send the closure and response channel to the worker thread!
-    // `THREAD_SENDER` is an unbounded channel so this shouldn't block but
+
+    // Send the closure to the worker thread!
+    // `task_sender` is an unbounded channel so this shouldn't block but
     // it may fail if the worker thread has stopped. In that case the
     // message gets given back to us and immediately dropped, satisfying the
     // closure safety conditions.
-    THREAD_SENDER
-        .send(Message { closure, response })
-        .map_err(|_| Error::Send)?;
-    // The closure is now running/pending running on the worker thread. It
-    // will notify us when it's done and in the meantime we must keep
-    // everything alive. Note that `recv` can fail, but only in the case
-    // where the channel gets disconnected and the only way that can happen
-    // is if the worker thread drops the message, so we're safe to exit.
-    receiver.recv().map_err(|_| Error::Recv)?;
-    let _ = result_ref;
-    let result = result.into_inner().unwrap();
-    // Our closure has now run successfully, so just read out and return the
-    // result. In the impossible event that it hasn't been initialised throw
-    // an error.
-    result.ok_or(Error::NotInit)
+    task_sender.send(closure).map_err(|_| Error::Send)?;
+    // The closure is now running/pending on the worker thread. It will notify
+    // us when it's done and in the meantime we must keep everything alive.
+    // Note that `recv` can fail, but only in the case where the channel gets
+    // disconnected and the only way that can happen is if the worker thread
+    // drops the message, so we're safe to exit.
+    receiver.recv().map_err(|_| Error::Recv)
 }
 
 /// The error type used by [`DiplomaticBag<T>::try_run()`].
@@ -606,8 +611,6 @@ enum Error {
     /// notification back, either the closure panicked or something in the
     /// queue before us panicked.
     Recv,
-    /// The result hasn't been initialised, this shouldn't be possible to hit.
-    NotInit,
 }
 
 impl std::error::Error for Error {}
@@ -618,22 +621,14 @@ impl fmt::Display for Error {
     }
 }
 
-/// The message to send to the worker thread, containing the code to run and
-/// the channel to notify us on when it's done.
-struct Message {
-    /// The code to run on the worker thread, the 'static bound is a bit
-    /// disingenuous as this closure only has to live until a notification is
-    /// sent to the response channel.
-    closure: Box<dyn FnOnce() + Send + 'static>,
-    /// The mechanism to notify the caller that the worker thread has consumed
-    /// the closure.
-    response: Sender<()>,
-}
+/// The code to run on the worker thread.
+type Message = Box<dyn FnOnce() + Send + 'static>;
 
 /// A wrapper type that makes it completely unsafe to access the type that it
 /// wraps. This is what makes the [`DiplomaticBag`] type `Send` and `Sync` even
 /// when `T` is not. It has similar semantics to [`ManuallyDrop`] as it just
 /// wraps one.
+#[repr(transparent)]
 struct Untouchable<T>(ManuallyDrop<T>);
 
 impl<T> Untouchable<T> {
@@ -677,7 +672,7 @@ impl<T> Untouchable<T> {
     /// inside the `Untouchable` never accessed again. Preferably, the
     /// `Untouchable` should be immediately dropped after calling this method.
     unsafe fn drop(&mut self) {
-        ManuallyDrop::drop(&mut self.0);
+        unsafe { ManuallyDrop::drop(&mut self.0) };
     }
 }
 
@@ -741,24 +736,24 @@ mod tests {
     }
 
     assert_impl_all!(DiplomaticBag<*mut ()>: Send, Sync);
-    assert_not_impl_any!(BaggageHandler<'_>: Send, Sync);
+    assert_not_impl_any!(BaggageHandler: Send, Sync);
     assert_impl_all!(Error: std::error::Error, Send, Sync);
 
     #[test]
     fn create_and_drop() {
-        let _value = DiplomaticBag::new(NotSend::new);
+        let _value = DiplomaticBag::new(|_| NotSend::new());
     }
 
     #[test]
     fn execute() {
-        let value = DiplomaticBag::new(NotSend::new);
-        value.map(|value| value.verify());
+        let value = DiplomaticBag::new(|_| NotSend::new());
+        value.map(|_, value| value.verify());
     }
 
     #[test]
     fn execute_ref() {
-        let value = DiplomaticBag::new(NotSend::new);
-        value.as_ref().map(|value| {
+        let value = DiplomaticBag::new(|_| NotSend::new());
+        value.as_ref().map(|_, value| {
             value.verify();
             value.change();
         });
@@ -766,8 +761,8 @@ mod tests {
 
     #[test]
     fn execute_mut() {
-        let mut value = DiplomaticBag::new(NotSend::new);
-        value.as_mut().map(|value| {
+        let mut value = DiplomaticBag::new(|_| NotSend::new());
+        value.as_mut().map(|_, value| {
             value.verify();
             value.change();
         });
@@ -783,7 +778,7 @@ mod tests {
             }
         }
 
-        let bag = DiplomaticBag::new(|| SetOnDrop(atomic.clone()));
+        let bag = DiplomaticBag::new(|_| SetOnDrop(atomic.clone()));
         assert!(!atomic.load(Ordering::SeqCst));
         drop(bag);
         assert!(atomic.load(Ordering::SeqCst));
