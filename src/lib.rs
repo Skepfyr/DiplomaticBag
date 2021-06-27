@@ -31,7 +31,7 @@
 //! handy when dealing with FFI types that must remain on the same thread for
 //! their existence.
 
-#![doc(html_root_url = "https://docs.rs/diplomatic-bag/0.1.1")]
+#![doc(html_root_url = "https://docs.rs/diplomatic-bag/0.2.0")]
 #![warn(
     keyword_idents,
     missing_crate_level_docs,
