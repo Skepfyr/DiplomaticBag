@@ -402,21 +402,48 @@ impl<T> Drop for DiplomaticBag<T> {
     }
 }
 
-/// Unfortunately, we can't implement `Debug` properly for `T`s that implement
-/// `Debug` because the formatter isn't `Send`. Instead, we just be a bit
-/// enigmatic and say we have something but refuse to say what it is.
-impl<T> fmt::Debug for DiplomaticBag<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "DiplomaticBag<{}> {{ .. }}", std::any::type_name::<T>())
+/// This `Debug` impl currently won't forward any formatting specifiers except
+/// for the `alternate` specifier (`#`).
+impl<T: fmt::Debug> fmt::Debug for DiplomaticBag<T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        struct AsIs(String);
+
+        impl fmt::Debug for AsIs {
+            fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+
+        let alt = f.alternate();
+
+        // Basically, run Debug on the worker thread, then send the resulting String back
+        let res = self.as_ref()
+            .map(move |_, this| {
+                if alt {
+                    format!("{:#?}", this)
+                } else {
+                    format!("{:?}", this)
+                }
+            })
+            .into_inner();
+
+        let res = AsIs(res); // So that we don't format it with quotes, etc.
+
+        f.debug_struct("DiplomaticBag")
+            .field("inner", &res)
+            .finish()
     }
 }
 
 // We can, however, implement a bunch of other useful standard traits, as below.
-// Annoyingly, `Display`, `serde::Serialize`, and `serde::Deserialize` all
-// suffer from the same problem as `Debug`. `From`, and `TryFrom` fail due
-// to the orphan rules. `AsRef` and `AsMut` can be implemented but conflict with
-// the existing `as_ref` and `as_mut` methods, and I'm not sure the confusion is
-// worth it.
+// Annoyingly, `serde::Serialize`, and `serde::Deserialize` both suffer from a worse
+// problem than `Debug` does. They have over 30 methods that would each need to
+// syncronise with the worker thread, rather than just a single result that comes
+// out the end. `Display` also has the same problem, and since it is more intended
+// for non-technical users, an implementation that doesn't forward all the formatting
+// parameters would be worse. `From`, and `TryFrom` fail due to the orphan rules.
+// `AsRef` and `AsMut` can be implemented but conflict with the existing `as_ref`
+// and `as_mut` methods, and I'm not sure the confusion is worth it.
 
 impl<T: Default> Default for DiplomaticBag<T> {
     fn default() -> Self {
