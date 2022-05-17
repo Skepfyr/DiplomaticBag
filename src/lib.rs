@@ -417,7 +417,8 @@ impl<T: fmt::Debug> fmt::Debug for DiplomaticBag<T> {
         let alt = f.alternate();
 
         // Basically, run Debug on the worker thread, then send the resulting String back
-        let res = self.as_ref()
+        let res = self
+            .as_ref()
             .map(move |_, this| {
                 if alt {
                     format!("{:#?}", this)
