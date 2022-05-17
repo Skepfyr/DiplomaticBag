@@ -34,7 +34,7 @@
 #![doc(html_root_url = "https://docs.rs/diplomatic-bag/0.3.1")]
 #![warn(
     keyword_idents,
-    missing_crate_level_docs,
+    rustdoc::missing_crate_level_docs,
     missing_debug_implementations,
     missing_docs,
     non_ascii_idents
