@@ -110,11 +110,6 @@ pub struct DiplomaticBag<T> {
     value: Untouchable<T>,
 }
 
-// SAFETY: This is the whole point of the library, Send and Sync are safe to
-// implement because accessing the variable held by the DiplomaticBag is unsafe.
-unsafe impl<T> Send for DiplomaticBag<T> {}
-unsafe impl<T> Sync for DiplomaticBag<T> {}
-
 impl<T> DiplomaticBag<T> {
     /// Create a new `DiplomaticBag` by invoking the provided closure and
     /// wrapping up the value that it produces. For why you would want to do
